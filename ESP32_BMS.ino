@@ -536,10 +536,6 @@ void allLoadOff()
   Serial.println("All load relays OFF");
 }
 
-// [FIX #3] Đặt relay tải theo "level" (0..4 nấc, mỗi nấc 250W) thay vì theo watt
-// trực tiếp. Chỉ bật/tắt relay cần thay đổi, không tắt hết rồi bật lại từ đầu
-// như setLoadLevel() cũ - tránh nháy tắt-bật không cần thiết ở các relay đã
-// đúng trạng thái.
 void setLoadRelayLevel(int level)
 {
   if (level < 0) level = 0;
@@ -629,12 +625,7 @@ bool isValidLoadLevel(int watt)
   return watt == 0 || watt == 250 || watt == 500 || watt == 750 || watt == 1000;
 }
 
-// [FIX #3] setLoadLevel() KHÔNG còn bật thẳng relay ở đây nữa.
-// Nó chỉ ghi nhận "yêu cầu" (requestedLoadW). Việc tăng dần từng nấc 250W,
-// kiểm tra an toàn ở MỖI nấc bằng dữ liệu BMS mới nhất, do manageLoadRamp()
-// trong loop() đảm nhiệm. Nhờ vậy nếu 500W không an toàn nhưng 250W an toàn,
-// hệ thống sẽ tự dừng và giữ ổn định ở 250W thay vì tắt hẳn về 0W hay tăng đại
-// lên 500W rồi mới cắt.
+
 void setLoadLevel(int watt)
 {
   if (!isValidLoadLevel(watt)) {
@@ -668,10 +659,6 @@ void setLoadLevel(int watt)
   addAlert("Web command: REQUEST LOAD " + String(watt) + "W");
 }
 
-// [FIX #3] Tăng dần tải lên đúng mức yêu cầu, mỗi nấc 250W, có kiểm tra an
-// toàn TRƯỚC khi tăng thêm nấc tiếp theo. Nếu người yêu cầu mức thấp hơn mức
-// đang bật (ví dụ đang 500W, người dùng chọn 250W) thì giảm ngay, không cần
-// chờ - vì giảm tải luôn an toàn hơn.
 void manageLoadRamp()
 {
   uint32_t now = millis();
@@ -718,10 +705,7 @@ void manageLoadRamp()
   addAlert("LOAD -> " + String(currentLoadW) + "W");
 }
 
-// [FIX #3] Khi tải ĐANG BẬT mà điều kiện trở nên không an toàn, LÙI XUỐNG 1
-// NẤC (250W) thay vì cắt thẳng về 0W. Nếu vẫn không an toàn ở nấc thấp hơn,
-// vòng loop tiếp theo (sau LOAD_SAFETY_STEP_INTERVAL_MS) sẽ tiếp tục lùi thêm,
-// cho tới khi an toàn hoặc về hẳn 0W.
+
 void maintainLoadSafety()
 {
   if (currentLoadW <= 0) return;
