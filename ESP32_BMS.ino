@@ -1,61 +1,4 @@
-/*
-  ESP32 + MCP2551 BMS CAN Receiver + Web API + MQTT
 
-  QUAN TRỌNG:
-  - MCP2551 chỉ là CAN transceiver, KHÔNG phải CAN controller như MCP2515.
-  - Với MCP2551, ESP32 sẽ dùng CAN controller nội bộ tên TWAI.
-  - Vì vậy code này KHÔNG dùng SPI, KHÔNG dùng mcp_can.h, KHÔNG dùng CS/INT.
-
-  Đấu dây đề xuất:
-  ESP32 GPIO22  -> TXD MCP2551
-  ESP32 GPIO21  <- RXD MCP2551 qua chia áp / level shifter vì MCP2551 thường chạy 5V
-  ESP32 GND     -> GND MCP2551
-  MCP2551 VDD   -> 5V
-  MCP2551 RS    -> GND hoặc qua điện trở 10k xuống GND
-  MCP2551 CANH  -> CANH BMS
-  MCP2551 CANL  -> CANL BMS
-
-  Lưu ý an toàn:
-  - MCP2551 là IC 5V. Chân RXD của MCP2551 có thể xuất mức cao 5V.
-  - ESP32 không chịu 5V ở GPIO. Nên dùng chia áp hoặc level shifter cho đường RXD -> ESP32 RX.
-
-  ================================================================
-  BẢN VÁ LỖI (FIX #1 - đã có từ trước):
-  - Lỗi: relay tải (250/500/750/1000W) bật lên rồi tự động tắt gần như
-    ngay sau đó, dù gotMask vừa mới = 0xFF.
-  - Nguyên nhân: mỗi khi CAN ID 0x300 (BASIC_1) đến với SEQ mới,
-    clearBmsDataForNewSeq() xóa sạch gotMask về 0 ngay lập tức.
-    Trong khi BMS chỉ gửi ~8 frame/giây (đúng 1 bộ dữ liệu/giây),
-    nên có một khoảng ~1 giây gotMask chưa kịp đầy lại. Trong lúc đó
-    hàm isSafeToEnableLoad() gọi hasCoreBmsData() thấy thiếu dữ liệu
-    tức thời và maintainLoadSafety() lập tức tắt relay.
-  - Cách fix: thêm biến lastCoreDataOkMs lưu lại thời điểm gần nhất
-    core data (BASIC1+BASIC2+BASIC3+CELLSTAT) đầy đủ. isSafeToEnableLoad()
-    sẽ dùng "độ mới" (age) của lần cuối có đủ core data thay vì kiểm tra
-    gotMask tức thời, với một khoảng grace period (mặc định 1500ms).
-
-  ================================================================
-  BẢN VÁ LỖI (FIX #2 - MỚI):
-  - Lỗi: khi mới cấp nguồn (chưa bấm gì), relay tải tự đóng bên NO-COM
-    (tức relay đang ở trạng thái ON). Khi bấm "bật tải" trên web thì
-    relay lại nhảy sang NC-COM (tức lại chuyển về OFF) -> NGƯỢC HOÀN TOÀN
-    với mong muốn.
-  - Nguyên nhân: code cấu hình LOAD_RELAY_ACTIVE_LOW = true, tức giả định
-    module relay tải là loại ACTIVE-LOW (mức LOW từ GPIO thì relay đóng
-    NO-COM, mức HIGH thì nhả về NC-COM). Nhưng module relay thực tế bạn
-    đang dùng lại là loại ACTIVE-HIGH (mức HIGH thì đóng NO-COM, mức LOW
-    thì nhả về NC-COM). Vì code và phần cứng ngược nhau nên toàn bộ logic
-    bật/tắt bị đảo chiều: trạng thái mặc định "OFF" (ghi HIGH) lại làm
-    relay đóng ON, còn lệnh "ON" (ghi LOW) lại làm relay nhả về OFF.
-  - Cách fix: đổi LOAD_RELAY_ACTIVE_LOW từ true thành false cho đúng với
-    module relay ACTIVE-HIGH đang dùng. Không cần sửa gì thêm trong logic
-    điều khiển, vì toàn bộ code đã dùng hằng số này một cách nhất quán.
-  - Lưu ý: nếu sau khi đổi mà relay CHG/DSG (RELAY_CHG_GPIO, RELAY_DSG_GPIO)
-    cũng bị hiện tượng tương tự (ngược NO/NC), thì đổi luôn
-    RELAY_ACTIVE_LOW từ true thành false. Hai cặp relay này dùng module
-    khác nhau nên có thể có chiều tín hiệu khác nhau, cần kiểm tra riêng.
-  ================================================================
-*/
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -143,14 +86,10 @@ uint32_t lastCanFrameMs = 0;
 uint32_t lastFullDataMs = 0;
 uint32_t lastCanRetryMs = 0;
 
-// [FIX] Thời điểm gần nhất core data (BASIC1+BASIC2+BASIC3+CELLSTAT) đầy đủ.
-// Dùng để tránh false-trigger khi gotMask bị xóa giữa chừng lúc bắt đầu SEQ mới.
+
 uint32_t lastCoreDataOkMs = 0;
 
-// [FIX] Grace period (ms): cho phép core data "cũ" trong khoảng thời gian này
-// vẫn được coi là an toàn, để không bị tắt relay giữa chừng khi đang chờ
-// nhận đủ lại 4 frame core của SEQ mới. Nên đặt lớn hơn chu kỳ gửi đầy đủ
-// của BMS một chút (BMS hiện tại ~1 giây/chu kỳ).
+
 #define CORE_DATA_GRACE_MS 1500
 
 uint8_t currentSeq = 255;
@@ -180,27 +119,7 @@ uint8_t auto_dsg = 0;
 #define RELAY_DSG_GPIO 33
 #define RELAY_ACTIVE_LOW true
 
-// ======================= 4-LEVEL LOAD CONTROL OUTPUT =======================
-// 4 relay tải thử nghiệm, mỗi relay tương ứng khoảng 250W.
-// 0W    = OFF OFF OFF OFF
-// 250W  = ON  OFF OFF OFF
-// 500W  = ON  ON  OFF OFF
-// 750W  = ON  ON  ON  OFF
-// 1000W = ON  ON  ON  ON
-//
-// Đấu dây đề xuất:
-// GPIO25 -> IN1 module relay -> tải 250W số 1
-// GPIO26 -> IN2 module relay -> tải 250W số 2
-// GPIO27 -> IN3 module relay -> tải 250W số 3
-// GPIO14 -> IN4 module relay -> tải 250W số 4
-//
-// [FIX #2] Module relay tải thực tế bạn đang dùng là loại ACTIVE-HIGH:
-// mức GPIO HIGH -> relay đóng NO-COM (ON), mức LOW -> nhả về NC-COM (OFF).
-// Trước đây code để LOAD_RELAY_ACTIVE_LOW = true (giả định active-low) nên
-// bị NGƯỢC HOÀN TOÀN: mặc định "OFF" lại đóng NO-COM, bấm "ON" lại nhả về
-// NC-COM. Đã đổi thành false để khớp đúng với phần cứng thực tế.
-// Nếu sau này đổi sang module relay khác (loại active-low thật), nhớ đổi
-// lại giá trị này thành true.
+
 #define LOAD_RELAY_1_GPIO 25
 #define LOAD_RELAY_2_GPIO 26
 #define LOAD_RELAY_3_GPIO 27
@@ -214,20 +133,6 @@ uint8_t auto_dsg = 0;
 
 int currentLoadW = 0;
 
-// [FIX #3] Mức tải NGƯỜI DÙNG YÊU CẦU (có thể khác với currentLoadW - mức tải
-// THỰC TẾ đang bật). Trước đây setLoadLevel() bật thẳng toàn bộ relay cần thiết
-// cho mức yêu cầu chỉ sau MỘT lần kiểm tra an toàn (dùng dữ liệu dòng điện TRƯỚC
-// khi tải được bật). Ngay sau đó, khi BMS báo dòng điện MỚI (do tải vừa đóng) vượt
-// ngưỡng, maintainLoadSafety() cắt THẲNG về 0W (allLoadOff), không giảm dần từng
-// nấc. Đây là lý do bấm 500/750/1000W có thể tự "tụt" về một mức thấp hơn (ví dụ
-// 250W) không theo ý muốn - vì hệ thống đang cố bảo vệ pin nhưng làm kiểu
-// "được hết hoặc mất hết" thay vì giảm dần.
-// Cách fix: tách currentLoadW (mức đang bật thật) và requestedLoadW (mức người
-// dùng muốn). Một hàm manageLoadRamp() chạy trong loop() sẽ tăng dần từng nấc
-// 250W một, kiểm tra an toàn TRƯỚC mỗi nấc tăng bằng dữ liệu BMS mới nhất; nếu
-// không an toàn thì GIỮ NGUYÊN mức hiện tại (không tăng thêm) thay vì cắt hết.
-// Khi mất an toàn ở mức đang bật, maintainLoadSafety() sẽ LÙI XUỐNG 1 nấc
-// (250W) mỗi lần, thay vì cắt thẳng về 0W.
 int requestedLoadW = 0;
 uint32_t lastLoadRampMs = 0;
 uint32_t lastLoadSafetyStepMs = 0;
